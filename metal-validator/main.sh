@@ -1,0 +1,418 @@
+#!/bin/bash
+echo 'Installing MetalGo on Ubuntu for MAINNET...'
+apt-get update -o Acquire::http::Pipeline-Depth=0
+apt-get install -y --no-install-recommends wget curl jq ca-certificates
+
+echo 'Downloading MetalGo v1.12.0-hotfix...'
+wget --no-check-certificate -O metalgo.tar.gz \
+  https://github.com/MetalBlockchain/metalgo/releases/download/v1.12.0-hotfix/metalgo-linux-amd64-v1.12.0-hotfix.tar.gz
+
+echo 'Extracting MetalGo...'
+tar -xzf metalgo.tar.gz
+mv metalgo-v1.12.0-hotfix/metalgo /usr/local/bin/
+chmod +x /usr/local/bin/metalgo
+rm -rf metalgo-v1.12.0-hotfix metalgo.tar.gz
+
+echo 'Creating data directory...'
+mkdir -p /root/.metalgo
+
+echo 'Setting file descriptor limits...'
+ulimit -n 65536
+echo "File descriptor limit set to: $(ulimit -n)"
+
+echo '========================================='
+echo 'Starting MetalGo node on MAINNET'
+echo 'Detecting public IP for proper P2P connectivity'
+echo '========================================='
+
+# Detect public IP - Universal approach for any Akash provider
+# Tries multiple methods in order of reliability
+echo 'Detecting public IP address for P2P connectivity...'
+PUBLIC_IP=""
+IP_SOURCE=""
+
+# Method 0: Manual override via environment variable (highest priority)
+# Users can set METAL_PUBLIC_IP in Akash Console when deploying
+# Accepts formats: IP only (203.45.67.89) or with http:// and port (http://203.45.67.89:9650)
+# Track if this is first deployment (no IP set) or second deployment (IP set)
+IS_FIRST_DEPLOYMENT=true
+if [ -n "$METAL_PUBLIC_IP" ]; then
+  # Strip http:// and https:// prefix if present
+  IP_CLEAN="${METAL_PUBLIC_IP#http://}"
+  IP_CLEAN="${IP_CLEAN#https://}"
+  # Strip port if present (everything after :)
+  IP_CLEAN="${IP_CLEAN%%:*}"
+  # Remove trailing slash if present
+  IP_CLEAN="${IP_CLEAN%/}"
+  
+  if [[ "$IP_CLEAN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    PUBLIC_IP="$IP_CLEAN"
+    IP_SOURCE="Manual override (METAL_PUBLIC_IP environment variable)"
+    IS_FIRST_DEPLOYMENT=false
+    echo "✅ Using manually specified public IP: $PUBLIC_IP"
+    echo "   (Set via METAL_PUBLIC_IP environment variable in Akash Console)"
+  else
+    echo "⚠️  WARNING: METAL_PUBLIC_IP is set but invalid format: $METAL_PUBLIC_IP"
+    echo "   Expected format: IP address (e.g., 203.45.67.89) or http://IP:port (e.g., http://203.45.67.89:9650)"
+    echo "   Ignoring and trying automatic detection..."
+  fi
+fi
+
+# Method 1: Kubernetes API for LoadBalancer IP (most accurate, if available)
+# According to Akash docs: IP lease is for INCOMING connections only
+# Outbound traffic uses different IP, so we MUST get LoadBalancer IP from K8s API
+if [ -z "$PUBLIC_IP" ] && [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+  KUBE_TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token 2>/dev/null)
+  KUBE_NAMESPACE=$(cat /var/run/secrets/kubernetes.io/serviceaccount/namespace 2>/dev/null || echo "default")
+  
+  if [ -n "$KUBE_TOKEN" ]; then
+    # Approach 1: Try to get LoadBalancer IP from all services
+    LB_IP=$(curl -s --max-time 5 \
+      -H "Authorization: Bearer $KUBE_TOKEN" \
+      --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+      "https://kubernetes.default.svc/api/v1/namespaces/$KUBE_NAMESPACE/services" 2>/dev/null | \
+      jq -r '.items[] | select(.spec.type=="LoadBalancer") | .status.loadBalancer.ingress[0].ip // empty' 2>/dev/null | head -1)
+    
+    # Approach 2: Try specific service name patterns if Approach 1 failed
+    if [ -z "$LB_IP" ] || [[ ! "$LB_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      for svc_name in "metal-endpoint" "metal-blockchain" "${HOSTNAME%-*}" "${AKASH_SERVICE_NAME:-}"; do
+        if [ -n "$svc_name" ]; then
+          LB_IP=$(curl -s --max-time 5 \
+            -H "Authorization: Bearer $KUBE_TOKEN" \
+            --cacert /var/run/secrets/kubernetes.io/serviceaccount/ca.crt \
+            "https://kubernetes.default.svc/api/v1/namespaces/$KUBE_NAMESPACE/services/$svc_name" 2>/dev/null | \
+            jq -r '.status.loadBalancer.ingress[0].ip // empty' 2>/dev/null)
+          
+          if [ -n "$LB_IP" ] && [[ "$LB_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            break
+          fi
+        fi
+      done
+    fi
+    
+    if [ -n "$LB_IP" ] && [[ "$LB_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      PUBLIC_IP="$LB_IP"
+      IP_SOURCE="Kubernetes API (LoadBalancer IP - for incoming connections)"
+      echo "✅ Detected LoadBalancer IP from Kubernetes API: $PUBLIC_IP"
+      echo "   (This is the IP for INCOMING connections, not outbound traffic)"
+    else
+      echo "⚠️  Kubernetes API query did not return LoadBalancer IP"
+      echo "   (May not have permissions or service not found)"
+    fi
+  fi
+else
+  echo "⚠️  Kubernetes service account token not found or inaccessible."
+  echo "   (Cannot query Kubernetes API for LoadBalancer IP)"
+fi
+
+# Method 2: Environment variable (if provider injects it)
+if [ -z "$PUBLIC_IP" ] && [ -n "$AKASH_IP" ]; then
+  if [[ "$AKASH_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    PUBLIC_IP="$AKASH_IP"
+    IP_SOURCE="Environment variable (AKASH_IP)"
+    echo "✅ Detected public IP from environment: $PUBLIC_IP"
+  fi
+fi
+
+# Method 3: Try service endpoint hostname resolution (if service name is known)
+if [ -z "$PUBLIC_IP" ]; then
+  # Try common Akash service naming patterns
+  for svc_name in "metal-endpoint" "metal-blockchain" "metalgo"; do
+    RESOLVED_IP=$(getent hosts ${svc_name} 2>/dev/null | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    if [ -n "$RESOLVED_IP" ] && [[ "$RESOLVED_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      PUBLIC_IP="$RESOLVED_IP"
+      IP_SOURCE="Service DNS resolution"
+      echo "✅ Detected public IP from service DNS: $PUBLIC_IP"
+      break
+    fi
+  done
+fi
+
+# Method 4: External IP services (fallback - may return provider NAT IP)
+# This is less reliable but works when other methods fail
+if [ -z "$PUBLIC_IP" ]; then
+  echo ""
+  echo "⚠️  WARNING: Falling back to external IP services"
+  echo "   These return EGRESS IP (outbound traffic), not LoadBalancer IP (incoming)"
+  echo "   This WILL cause IP mismatch and 'Not Connected' status!"
+  echo "   SOLUTION: Set METAL_PUBLIC_IP=<loadbalancer-ip> environment variable"
+  echo ""
+  for service in "api.ipify.org" "ifconfig.me" "icanhazip.com" "checkip.amazonaws.com"; do
+    IP=$(curl -4 -s --max-time 10 https://$service 2>/dev/null || \
+         curl -4 -s --max-time 10 http://$service 2>/dev/null)
+    
+    if [ -n "$IP" ] && [[ "$IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+      PUBLIC_IP="$IP"
+      IP_SOURCE="External service ($service) - EGRESS IP (WRONG for incoming!)"
+      echo "⚠️  ⚠️  ⚠️  CRITICAL: Detected EGRESS IP: $PUBLIC_IP"
+      echo "⚠️  This is the OUTBOUND IP, NOT the LoadBalancer IP for incoming connections!"
+      echo "⚠️  Your LoadBalancer IP (for incoming) is in Akash Console → Deployment → 'IP(s)'"
+      echo "⚠️  Set METAL_PUBLIC_IP=<loadbalancer-ip> to fix 'Not Connected' status"
+      break
+    fi
+  done
+fi
+
+# Decide whether to use --public-ip flag
+if [ -z "$PUBLIC_IP" ]; then
+  echo ""
+  echo "⚠️  WARNING: Could not detect public IP automatically"
+  echo "⚠️  Starting MetalGo without --public-ip flag"
+  echo "⚠️  MetalGo will use built-in NAT traversal (may work but less reliable)"
+  echo "⚠️  For best results, check Akash Console for LoadBalancer IP and redeploy with manual IP if needed"
+  PUBLIC_IP_FLAG=""
+else
+  PUBLIC_IP_FLAG="--public-ip=$PUBLIC_IP"
+  echo ""
+  echo "📋 IP Detection Summary:"
+  echo "   Source: $IP_SOURCE"
+  echo "   Detected IP: $PUBLIC_IP"
+  echo ""
+  if [[ "$IP_SOURCE" == *"EGRESS IP"* ]] || [[ "$IP_SOURCE" == *"External service"* ]]; then
+    echo "⚠️  ⚠️  ⚠️  CRITICAL: EGRESS IP DETECTED (WRONG FOR INCOMING!) ⚠️  ⚠️  ⚠️"
+    echo ""
+    echo "   According to Akash IP Leases docs:"
+    echo "   - IP lease is for INCOMING connections only"
+    echo "   - Outbound traffic uses DIFFERENT IP"
+    echo "   - External services return EGRESS IP, not LoadBalancer IP"
+    echo ""
+    echo "   Detected IP ($PUBLIC_IP) is EGRESS IP (for outbound traffic)"
+    echo "   This will cause 'Not Connected' status in explorer!"
+    echo ""
+    echo "   🔧 FIX: Set METAL_PUBLIC_IP=<loadbalancer-ip> in Akash Console"
+    echo "   Get LoadBalancer IP from: Console → Deployment → 'IP(s)' field"
+    echo ""
+    echo "   ⚠️  Continuing with WRONG IP - explorer will show 'Not Connected'"
+    echo "   Consider stopping and redeploying with METAL_PUBLIC_IP set"
+  elif [ "$IP_SOURCE" = "Manual override (METAL_PUBLIC_IP environment variable)" ]; then
+    echo "✅ Using manual IP override - should match LoadBalancer IP ✅"
+    echo "   Verify in Akash Console that this matches the 'IP(s)' field"
+  else
+    echo "⚠️  VERIFICATION: Compare with LoadBalancer IP in Akash Console"
+    echo "   If mismatch: Set METAL_PUBLIC_IP=<loadbalancer-ip>"
+  fi
+  echo ""
+fi
+
+echo 'Starting MetalGo with explicit public IP...'
+
+/usr/local/bin/metalgo \
+  --network-id=mainnet \
+  --http-host=0.0.0.0 \
+  --http-port=9650 \
+  --staking-port=9651 \
+  --staking-host=0.0.0.0 \
+  $PUBLIC_IP_FLAG \
+  --log-level=info &
+
+METAL_PID=$!
+
+echo 'Waiting for MetalGo to initialize (30 seconds)...'
+sleep 30
+
+echo 'Waiting for API to be ready...'
+for i in {1..20}; do
+  if curl -s --max-time 5 http://localhost:9650/ext/health > /dev/null 2>&1; then
+    echo 'API is ready!'
+    break
+  fi
+  echo "Waiting for API... attempt $i/20"
+  sleep 15
+done
+
+echo 'Waiting for blockchain to bootstrap...'
+while true; do
+  RESPONSE=$(curl -s --max-time 10 -X POST \
+    -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","method":"info.isBootstrapped","params":{"chain":"X"},"id":1}' \
+    http://localhost:9650/ext/info 2>/dev/null)
+  
+  if echo "$RESPONSE" | jq -e '.result.isBootstrapped == true' > /dev/null 2>&1; then
+    echo 'Bootstrap complete!'
+    break
+  fi
+  echo 'Still bootstrapping... (this can take several minutes)'
+  sleep 30
+done
+
+# Wait a bit more for P2P connections to establish
+echo 'Waiting for P2P connections to establish...'
+sleep 15
+
+# Get node information
+echo 'Retrieving node information...'
+NODE_INFO=$(curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"info.getNodeID","params":{},"id":1}' \
+  http://localhost:9650/ext/info 2>/dev/null)
+
+NODE_ID=$(echo "$NODE_INFO" | jq -r '.result.nodeID // "N/A"' 2>/dev/null)
+BLS_KEY=$(echo "$NODE_INFO" | jq -r '.result.nodePOP.publicKey // "N/A"' 2>/dev/null)
+BLS_SIG=$(echo "$NODE_INFO" | jq -r '.result.nodePOP.proofOfPossession // "N/A"' 2>/dev/null)
+
+# Get peer information
+PEERS_INFO=$(curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"info.peers","params":{},"id":1}' \
+  http://localhost:9650/ext/info 2>/dev/null)
+
+PEER_COUNT=$(echo "$PEERS_INFO" | jq -r '.result.numPeers // 0' 2>/dev/null)
+if [ -z "$PEER_COUNT" ] || [ "$PEER_COUNT" = "null" ]; then
+  PEER_COUNT=0
+fi
+
+# Use the IP we detected and passed to MetalGo
+if [ -n "$PUBLIC_IP" ]; then
+  ADVERTISED_IP="$PUBLIC_IP (explicitly set)"
+else
+  # Fallback: Get IP that MetalGo detected
+  NODE_IP_INFO=$(curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","method":"info.getNodeIP","params":{},"id":1}' \
+    http://localhost:9650/ext/info 2>/dev/null)
+  DETECTED_IP=$(echo "$NODE_IP_INFO" | jq -r '.result.ip // empty' 2>/dev/null)
+  
+  if [ -n "$DETECTED_IP" ]; then
+    ADVERTISED_IP="$DETECTED_IP (auto-discovered)"
+  else
+    ADVERTISED_IP="Check Akash Console for MetalLB IP"
+  fi
+fi
+
+echo ""
+# Show different output based on deployment phase
+if [ "$IS_FIRST_DEPLOYMENT" = true ]; then
+  # FIRST DEPLOYMENT - Initial setup (no IP configured yet)
+  echo "========================================"
+  echo "METAL MAINNET VALIDATOR - INITIAL SETUP"
+  echo "========================================"
+  echo ""
+  if [ "$PEER_COUNT" -gt 0 ] 2>/dev/null; then
+    echo "✅ Node is running"
+    echo "✅ Connected to $PEER_COUNT peers"
+    echo "✅ Network: Metal Mainnet"
+  else
+    echo "⚠️  Node is starting up..."
+    echo "⚠️  Connected to $PEER_COUNT peers (may still be connecting)"
+    echo "✅ Network: Metal Mainnet"
+  fi
+  echo ""
+  echo "Next steps:"
+  echo "1. Go to Akash Console → Leases tab → Copy the IP address"
+  echo "   (Example format: 203.45.67.89:9650)"
+  echo "2. Update deployment: METAL_PUBLIC_IP=http://YOUR-IP-HERE:9650"
+  echo "   (Replace YOUR-IP-HERE with your actual IP from step 1)"
+  echo ""
+  echo "⚠️  No IP assigned? Redeploy on a different provider."
+  echo ""
+  echo "⚠️  IMPORTANT: Complete step 2 to finalize setup"
+  echo ""
+  echo "========================================"
+  echo ""
+  echo "Keeping node running... (complete IP update to see validator data)"
+else
+  # SECOND DEPLOYMENT - IP configured, show full setup data
+  echo "========================================"
+  echo "METAL MAINNET VALIDATOR - SETUP DATA"
+  echo "========================================"
+  echo ""
+  echo "⚠️  SAVE THIS DATA NOW ⚠️"
+  echo ""
+  echo "Node ID"
+  echo "$NODE_ID"
+  echo ""
+  echo "Proof of Possession - Public Key"
+  echo "$BLS_KEY"
+  echo ""
+  echo "Proof of Possession - Signature"
+  echo "$BLS_SIG"
+  echo ""
+  if [ -n "$PUBLIC_IP" ]; then
+    echo "Public IP (RPC Endpoint)"
+    echo "$PUBLIC_IP:9650"
+    echo ""
+    echo "Note: Save this IP for reference (useful for Grafana monitoring template)"
+    echo ""
+  fi
+  echo "Register your validator: https://wallet.metalblockchain.org/"
+  echo ""
+  echo "========================================"
+  echo "VERIFICATION"
+  echo "========================================"
+  echo ""
+  if [ "$PEER_COUNT" -gt 0 ] 2>/dev/null; then
+    echo "✅ Node is operational"
+    echo "✅ Connected to $PEER_COUNT peer(s)"
+    if [ "$PEER_COUNT" -ge 50 ] 2>/dev/null; then
+      echo "✅ Good connectivity (50+ peers)"
+    elif [ "$PEER_COUNT" -ge 20 ] 2>/dev/null; then
+      echo "⚠️  Moderate connectivity ($PEER_COUNT peers - may improve over time)"
+    else
+      echo "⚠️  Low peer count ($PEER_COUNT peers - check network connectivity)"
+    fi
+  else
+    echo "⚠️  Node is starting up..."
+    echo "⚠️  Connected to $PEER_COUNT peer(s) (may still be connecting)"
+  fi
+  echo ""
+  if [ -n "$PUBLIC_IP" ]; then
+    echo "✅ IP configured: $PUBLIC_IP:9650"
+    echo "   (Verify this matches your IP in Akash Console → Leases → IP(s))"
+  fi
+  echo ""
+  echo "========================================"
+  echo "BACKUP YOUR VALIDATOR (HIGHLY RECOMMENDED)"
+  echo "========================================"
+  echo ""
+  echo "Protect your validator! Backup now to recover if provider goes down."
+  echo ""
+  echo "Quick Backup (2 minutes):"
+  echo "1. Go to Akash Console → Your Deployment → Shell tab"
+  echo "2. Run: curl -s https://raw.githubusercontent.com/VirgilBB/Metal-Validator/main/metal-node-recovery/backup-node.sh | bash"
+  echo "3. Copy and securely save the base64 backup string"
+  echo "4. Store it safely (password manager, encrypted file, etc.)"
+  echo ""
+  echo "Need recovery? Email cerebro@cerebro.host"
+  echo ""
+  echo "⚠️  Your backup contains staking keys - keep it secure!"
+  echo ""
+  echo "========================================"
+  echo ""
+  echo "Keeping node running... (check logs for ongoing activity)"
+fi
+
+# Keep container running and show periodic status with validator data
+# Only show validator data if IP is configured (second deployment)
+while true; do
+  sleep 1200  # Every 20 minutes
+  CURRENT_PEERS=$(curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"jsonrpc":"2.0","method":"info.peers","params":{},"id":1}' \
+    http://localhost:9650/ext/info | jq -r '.result.numPeers // 0')
+  
+  if [ "$IS_FIRST_DEPLOYMENT" = false ]; then
+    # Only show validator data if IP is configured (after second deployment)
+    echo ""
+    echo "========================================"
+    echo "[$(date)] Validator Status"
+    echo "========================================"
+    echo "✅ Connected to $CURRENT_PEERS peers"
+    echo ""
+    echo "Node ID:"
+    echo "$NODE_ID"
+    echo ""
+    echo "Public Key:"
+    echo "$BLS_KEY"
+    echo ""
+    echo "Signature:"
+    echo "$BLS_SIG"
+    echo ""
+    if [ -n "$PUBLIC_IP" ]; then
+      echo "RPC Endpoint:"
+      echo "$PUBLIC_IP:9650"
+      echo ""
+    fi
+    echo "Register: https://wallet.metalblockchain.org/"
+    echo "========================================"
+  else
+    # First deployment - just show status
+    echo ""
+    echo "[$(date)] Status: Connected to $CURRENT_PEERS peer(s) - Complete IP update to see validator data"
+  fi
+done
