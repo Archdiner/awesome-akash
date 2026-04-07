@@ -6,43 +6,43 @@ js_framework() {
   html_regex=$(if ls *.html >/dev/null 2>&1 && [ ! -f "package.json" ] && [ ! -f "yarn.lock" ]; then echo "true"; fi)
 
   if command -v npm >/dev/null 2>&1; then
-    if npm ls --depth=0 | grep "umijs" >/dev/null 2>&1; then
+    if grep -iq \'"umijs"\' package.json 2>/dev/null; then
       FRAMEWORK="Umi.js"
-    elif npm ls --depth=0 | grep "vitepress" >/dev/null 2>&1; then
+    elif grep -iq \'"vitepress"\' package.json 2>/dev/null; then
       FRAMEWORK="Vitepress"
-    elif npm ls --depth=0 | grep "react-scripts" >/dev/null 2>&1 && [ ! -f "ionic.config.json" ]; then
+    elif grep -iq \'"react-scripts"\' package.json 2>/dev/null && [ ! -f "ionic.config.json" ]; then
       FRAMEWORK="React (Create React App)"
     elif [ -f "ionic.config.json" ] && [ ! -f "angular.json" ]; then
       FRAMEWORK="Ionic React"
-    elif npm ls --depth=0 | grep "gatsby" >/dev/null 2>&1; then
+    elif grep -iq \'"gatsby"\' package.json 2>/dev/null; then
       FRAMEWORK="Gatsby.js"
-    elif npm ls --depth=0 | grep "vue" >/dev/null 2>&1 && [ -f "vue.config.js" ]; then
+    elif grep -iq \'"vue"\' package.json 2>/dev/null && [ -f "vue.config.js" ]; then
       FRAMEWORK="Vue.js"
-    elif ([ -f "vite.config.js" ] || [ -f "vite.config.ts" ]) && (npm ls | grep -qw "vite" && npm ls | grep -qw "react") >/dev/null 2>&1; then
+    elif ([ -f "vite.config.js" ] || [ -f "vite.config.ts" ]) && (grep -iq '"vite"' package.json && grep -iq '"react"' package.json) >/dev/null 2>&1; then
       FRAMEWORK="Vite-react.js"
-    elif npm ls --depth=0 | grep "astro" >/dev/null 2>&1; then
+    elif grep -iq \'"astro"\' package.json 2>/dev/null; then
       FRAMEWORK="Astro.js"
-    elif npm ls --depth=0 | grep "next" && ls next.config.* >/dev/null 2>&1; then
+    elif grep -iq \'"next"\' package.json && ls next.config.* >/dev/null 2>&1; then
       FRAMEWORK="Next.js"
     elif [ -f "ionic.config.json" ] && [ -f "angular.json" ]; then
       FRAMEWORK="Ionic Angular"
     elif [ ! -f "ionic.config.json" ] && [ -f "angular.json" ] || (grep -q '"@angular/core"' package.json); then
       FRAMEWORK="Angular"
-    elif npm ls --depth=0 | grep "express" >/dev/null 2>&1; then
+    elif grep -iq \'"express"\' package.json 2>/dev/null; then
       FRAMEWORK="Express.js"
-    elif npm ls --depth=0 | grep "svelte" && [ -f "svelte.config.js" ] >/dev/null 2>&1; then
+    elif grep -iq \'"svelte"\' package.json && [ -f "svelte.config.js" ] >/dev/null 2>&1; then
       FRAMEWORK="Svelte"
-    elif npm ls --depth=0 | grep "ember-cli" >/dev/null 2>&1; then
+    elif grep -iq \'"ember-cli"\' package.json 2>/dev/null; then
       FRAMEWORK="Ember.js"
-    elif npm ls --depth=0 | grep -E "vue|nuxt" >/dev/null 2>&1; then
+    elif grep -iEq '"(vue|nuxt)"' package.json 2>/dev/null; then
       FRAMEWORK="Nuxt.js"
-    elif npm ls --depth=0 | grep "11ty" >/dev/null 2>&1; then
+    elif grep -iq \'"11ty"\' package.json 2>/dev/null; then
       FRAMEWORK="11ty"
-    elif npm ls --depth=0 | grep "gridsome" >/dev/null 2>&1; then
+    elif grep -iq \'"gridsome"\' package.json 2>/dev/null; then
       FRAMEWORK="Gridsome"
     elif [ -f "remix.config.js" ]; then
       FRAMEWORK="Remix"
-    elif ls webpack.config.* >/dev/null 2>&1 && npm ls --depth=0 | grep -q "preact"; then
+    elif ls webpack.config.* >/dev/null 2>&1 && grep -iq \'"preact"\' package.json; then
       FRAMEWORK="Preact"
     elif [ -f "stencil.config.ts" ]; then
       FRAMEWORK="Stencil"
